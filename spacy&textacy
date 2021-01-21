@@ -1,0 +1,205 @@
+# Extracting SPOs.
+# python -m spacy download en -> To donwload the en model of spacy.
+
+import spacy
+import textacy
+
+# Subject Verb Object detection
+
+
+class KnowledgeExtraction:
+
+    def retrieveKnowledge(self, textInput):
+        nlp = spacy.load('en_core_web_sm')
+        text = nlp(textInput)
+        text_ext = textacy.extract.subject_verb_object_triples(text)
+        return list(text_ext)
+
+import requests
+import json
+
+
+class EntityRecognitionLinking:
+
+    class APIError(Exception):
+
+        def __init__(self, status):
+            self.status = status
+
+        def __str__(self):
+            return "APIError: status={}".format(self.status)
+
+    def entityRecogLink(self, text):
+
+        # Base URL for Spotlight API
+        base_url = "http://api.dbpedia-spotlight.org/en/annotate"
+        # Parameters
+        # 'text' - text to be annotated
+        # 'confidence' -   confidence score for linking
+        #params = {"text": "My name is Sundar. I am currently doing Master's in Artificial Intelligence at NUS. I love Natural Language Processing.", "confidence": 0.35}
+        params = {"text": text, "confidence": 0.35}
+        # Response content type
+        #headers = {'accept': 'text/html'}
+        headers = {'accept': 'application/json'}
+        # GET Request
+        proxies = {"http": None, "https": None}
+        res = requests.get(base_url, params=params, headers=headers,proxies=proxies)
+        if res.status_code != 200:
+            # Something went wrong
+            raise APIError(res.status_code)
+        # Display the result as HTML in Jupyter Notebook
+        # display(HTML(res.text))
+        # Pretty printing as json
+        print(json.dumps(json.loads(res.text), sort_keys=True, indent=4))
+        return json.loads(res.text)
+
+# To put the information extracted (SOP triples linked to DBpedia) onto a graph database.
+# Also, visualisation of the generated graph.
+
+from neomodel import StructuredNode, StringProperty, RelationshipTo, RelationshipFrom, config, StructuredRel
+
+config.DATABASE_URL = 'bolt://neo4j:neo4j@localhost:7687'#default
+
+
+class RelationshipModel(StructuredRel):
+    DBpediaURL = StringProperty()
+    relationType = StringProperty()
+
+
+class Object(StructuredNode):
+    object_name = StringProperty(unique_index=True)
+    DBpediaURL = StringProperty()
+    # books = RelationshipFrom(Subject, 'predicate')
+
+
+class Subject(StructuredNode):
+    subject_name = StringProperty(unique_index=True)
+    DBpediaURL = StringProperty()
+    predicate = RelationshipTo(
+        Object, 'predicate', model=RelationshipModel)
+
+
+class GraphPopulation:
+
+    def popGraph(self, spoData, entityLinks):
+
+        print("Data received in graph population:")
+        print(spoData)
+        for index in range(len(spoData)):
+            spo = spoData[index]
+
+            # Subject and Object DBpedia links.
+            subjectDBpediaURL = entityLinks[index][0]
+            objectDBpediaURL = entityLinks[index][2]
+
+            # Check if the subject already exists
+            # Todo: Don't use neomodel here. Because this is making you check for existing every time. There should be a better way to do create or update.
+            subjectTemp = Subject.nodes.first_or_none(subject_name=spo[0])
+            subject_extracted = None
+            if subjectTemp == None:
+                subject_extracted = Subject(
+                    subject_name=spo[0], DBpediaURL=subjectDBpediaURL).save()
+            else:
+                subject_extracted = subjectTemp
+            objectTemp = Object.nodes.first_or_none(object_name=spo[2])
+            object_extracted = None
+            if objectTemp == None:
+                object_extracted = Object(
+                    object_name=spo[2], DBpediaURL=objectDBpediaURL).save()
+            else:
+                object_extracted = objectTemp
+            # Todo: Also check if the predicate is already present. If not, only then run the below line.
+
+            """
+            if subject_extracted.predicate.is_connected(object_extracted):
+                    rels = subject_extracted.predicate.relationship(
+                        object_extracted)
+                    print("Junk")
+                    print(rels.predicateName)
+                    relExist = False
+                    for rel in rels:
+                        if rel.predicateName == spo[1]:
+                            relExist = True
+                    if relExist == False:
+                        relationship = subject_extracted.predicate.connect(
+                            object_extracted)
+                        relationship.predicateName = spo[1]
+            """
+
+            # Dynamically changing relation type using neomodel.
+            # Reference: https://neomodel.readthedocs.io/en/latest/module_documentation.html
+            # The relation is of type ZeroOrOne which has properties source and definition.
+            subject_extracted.predicate.definition['relation_type'] = spo[1]
+            relationship = subject_extracted.predicate.connect(
+                object_extracted)
+            relationship.relationType = spo[1]
+            relationship.DBpediaURL = entityLinks[index][1]
+            relationship.save()
+
+        all_subject_nodes = Subject.nodes.all()
+        all_object_nodes = Object.nodes.all()
+
+        for node in all_subject_nodes:
+            print(node)
+
+        for node in all_object_nodes:
+            print(node)
+
+    def delete_all_nodes(self):
+        all_subject_nodes = Subject.nodes.all()
+        all_object_nodes = Object.nodes.all()
+
+        for node in all_subject_nodes:
+            node.delete()
+
+        for node in all_object_nodes:
+            node.delete()
+
+
+#GraphPopulationObj = GraphPopulation()
+# GraphPopulationObj.delete_all_nodes()
+
+
+inputText = '''
+Stocks were little changed Thursday morning, holding near recent record levels.
+
+The S&P 500, Dow and Nasdaq hit record highs on Wednesday, as traders looked ahead to the additional fiscal stimulus and other government spending likely to occur under President Joe Biden’s administration. Biden began his term on Wednesday by signing a number of executive orders to address the COVID-19 pandemic, enable environmental protection initiatives and roll back many of the Trump administration’s immigration policies, among other measures. He is also poised to sign additional executive orders on Thursday.
+
+The S&P 500 posted its best Inauguration Day return since Ronald Reagan’s second inauguration in 1985, according to an analysis by LPL Financial. And the index’s move from Election Day to Inauguration Day was its best ever, with the S&P 500 climbing more than 14% between Nov. 3 and Wednesday’s close.'''
+
+# Step 1: Knowledge Extraction. Output: SOP triples
+knowledgeExtractionObj = KnowledgeExtraction()
+sop_list = knowledgeExtractionObj.retrieveKnowledge(inputText)
+#list_sop = sop_list.as_doc()
+sop_list_strings = []
+for sop in sop_list:
+    temp = []
+    temp.append(sop[0].text)
+    temp.append(sop[1].text)
+    temp.append(sop[2].text)
+    sop_list_strings.append(temp)
+
+print(sop_list_strings)
+
+# Step 2: Entity recognition and linking. This step needs to be linked.
+entityRecognitionLinkingObj = EntityRecognitionLinking()
+entityRelJson = entityRecognitionLinkingObj.entityRecogLink(inputText)
+
+entityLinkTriples = []
+for sop in sop_list_strings:
+    tempTriple = ['', '', '']
+    for resource in entityRelJson['Resources']:
+        if resource['@surfaceForm'] == sop[0]:
+            tempTriple[0] = resource['@URI']
+        if resource['@surfaceForm'] == sop[1]:
+            tempTriple[1] = resource['@URI']
+        if resource['@surfaceForm'] == sop[2]:
+            tempTriple[2] = resource['@URI']
+    entityLinkTriples.append(tempTriple)
+print(entityLinkTriples)
+
+# Step 3: Knowledge Graph creation.
+graphPopulationObj = GraphPopulation()
+graphPopulationObj = graphPopulationObj.popGraph(
+    sop_list_strings, entityLinkTriples)
+
